@@ -40,11 +40,11 @@ brew install cmake ninja pkg-config icu4c capstone
 pip3 install pyelftools requests
 ```
 
-### macOS Ventura and Sonoma (clang 16)
+### macOS Ventura and Sonoma (clang 19)
 - Install XCode
-- Install clang 16 and required tools
+- Install clang 19 and required tools
 ```
-brew install llvm@16 cmake ninja pkg-config icu4c capstone
+brew install llvm@19 cmake ninja pkg-config icu4c capstone
 pip3 install pyelftools requests
 ```
 
