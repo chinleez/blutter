@@ -468,7 +468,8 @@ std::string DartDumper::ObjectToString(dart::Object& obj, bool simpleForm, bool 
 			case dart::kFloat32x4ArrayElement:
 			case dart::kInt32x4ArrayElement:
 			case dart::kFloat64x2ArrayElement:
-				FATAL("TODO: simd array");
+				txt = "<simd array>";
+				break;
 			}
 
 			txt += ']';
@@ -690,7 +691,7 @@ std::string DartDumper::ObjectToString(dart::Object& obj, bool simpleForm, bool 
 	ASSERT(obj.IsInstance());
 
 	if (cid < dart::kNumPredefinedCids) {
-		FATAL("Unhandle internal class %s (%ld)", app.GetClass(cid)->Name().c_str(), cid);
+		return std::format("Unhandled internal class {} ({})", app.GetClass(cid)->Name(), cid);
 	}
 
 	// TODO: print library and package prefix
@@ -782,16 +783,16 @@ std::string DartDumper::dumpInstanceFields(dart::Object& obj, DartClass& dartCls
 				if (p->IsHeapObject()) {
 					auto objPtr2 = p->Decompress(app.heap_base());
 					if (objPtr2 != nullptr && objPtr2.GetClassId() != dart::kNullCid) {
-						obj = objPtr2;
+						auto& fieldObj = dart::Object::Handle(objPtr2);
 						if (simpleForm || objPtr2.GetClassId() < dart::kNumPredefinedCids)
-							txtField = std::format("off_{:x}: {}", offset, ObjectToString(obj, simpleForm, nestedObj, depth));
+							txtField = std::format("off_{:x}: {}", offset, ObjectToString(fieldObj, simpleForm, nestedObj, depth));
 						else
-							txtField = std::format("off_{:x}_{}", offset, ObjectToString(obj, simpleForm, nestedObj, depth));
+							txtField = std::format("off_{:x}_{}", offset, ObjectToString(fieldObj, simpleForm, nestedObj, depth));
 					}
 				}
 				else {
-					obj = p->DecompressSmi();
-					txtField = std::format("off_{:x}_Smi: {:#x}", offset, dart::Smi::Cast(obj).Value());
+					auto& fieldObj = dart::Object::Handle(p->DecompressSmi());
+					txtField = std::format("off_{:x}_Smi: {:#x}", offset, dart::Smi::Cast(fieldObj).Value());
 				}
 			}
 		}

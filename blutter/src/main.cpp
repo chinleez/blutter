@@ -18,6 +18,10 @@ int main(int argc, char** argv)
 		parser.ParseCLI(argc, argv);
 
 		auto& libappPath = args::get(infile);
+		if (!std::filesystem::is_regular_file(libappPath)) {
+			std::cerr << "Input file does not exist: " << libappPath << "\n";
+			return 1;
+		}
 
 		std::filesystem::path outDir{ args::get(outdir) };
 		std::error_code ec;
@@ -75,6 +79,7 @@ int main(int argc, char** argv)
 	}
 	catch (std::exception& e) {
 		std::cerr << "exception: " << e.what() << "\n";
+		return 1;
 	}
 
 	return 0;

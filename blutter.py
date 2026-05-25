@@ -3,13 +3,13 @@ import argparse
 import glob
 import mmap
 import os
-import platform
 import shutil
 import subprocess
 import sys
 import zipfile
 import tempfile
 from dartvm_fetch_build import DartLibInfo
+from build_env import macos_brew_llvm_env
 
 CMAKE_CMD = "cmake"
 NINJA_CMD = "ninja"
@@ -140,13 +140,7 @@ def cmake_blutter(input: BlutterInput):
     builddir = os.path.join(BUILD_DIR, input.blutter_name)
     
     macros = find_compat_macro(input.dart_info.version, input.no_analysis)
-    my_env = None
-    if platform.system() == 'Darwin':
-        mac_ver = int(platform.mac_ver()[0].split('.', 1)[0])
-        if mac_ver < 15:
-            llvm_path = subprocess.run(['brew', '--prefix', 'llvm@19'], capture_output=True, check=True).stdout.decode().strip()
-            clang_file = os.path.join(llvm_path, 'bin', 'clang')
-            my_env = {**os.environ, 'CC': clang_file, 'CXX': clang_file+'++'}
+    my_env = macos_brew_llvm_env()
     # cmake -GNinja -Bbuild -DCMAKE_BUILD_TYPE=Release
     subprocess.run([CMAKE_CMD, '-GNinja', '-B', builddir, f'-DDARTLIB={input.dart_info.lib_name}', f'-DNAME_SUFFIX={input.name_suffix}', '-DCMAKE_BUILD_TYPE=Release', '--log-level=NOTICE'] + macros, cwd=blutter_dir, check=True, env=my_env)
 
@@ -156,8 +150,16 @@ def cmake_blutter(input: BlutterInput):
 
 def get_dart_lib_info(libapp_path: str, libflutter_path: str) -> DartLibInfo:
     # getting dart version
-    from extract_dart_info import extract_dart_info
-    dart_version, snapshot_hash, flags, arch, os_name = extract_dart_info(libapp_path, libflutter_path)
+    try:
+        from extract_dart_info import DartInfoError, extract_dart_info
+    except ModuleNotFoundError as e:
+        missing_module = e.name
+        sys.exit(f'Missing Python module "{missing_module}". Install dependencies with: pip3 install pyelftools requests')
+
+    try:
+        dart_version, snapshot_hash, flags, arch, os_name = extract_dart_info(libapp_path, libflutter_path)
+    except DartInfoError as e:
+        sys.exit(str(e))
     print(f'Dart version: {dart_version}, Snapshot: {snapshot_hash}, Target: {os_name} {arch}')
     print('flags: ' + ' '.join(flags))
 
@@ -210,7 +212,10 @@ def build_and_run(input: BlutterInput):
         subprocess.run([input.blutter_file, '-i', input.libapp_path, '-o', input.outdir], check=True)
 
 def main_no_flutter(libapp_path: str, dart_version: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool):
-    version, os_name, arch = dart_version.split('_')
+    try:
+        version, os_name, arch = dart_version.split('_')
+    except ValueError:
+        sys.exit('Invalid --dart-version format. Expected "<version>_<os>_<arch>", for example "3.4.2_android_arm64"')
     dart_info = DartLibInfo(version, os_name, arch)
     input = BlutterInput(libapp_path, dart_info, outdir, rebuild_blutter, create_vs_sln, no_analysis)
     build_and_run(input)

@@ -4,6 +4,7 @@ import shutil
 import stat
 import subprocess
 import sys
+from build_env import macos_brew_llvm_env
 
 # assume git and cmake (64 bits) command is in PATH
 GIT_CMD = "git"
@@ -152,9 +153,10 @@ def cmake_dart(info: DartLibInfo, target_dir: str):
     # Note: pointer compression feature is set from Flutter and no one change it when building app.
     #       so only one build of Dart runtime is enough
     builddir = os.path.join(BUILD_DIR, info.lib_name)
+    my_env = macos_brew_llvm_env()
     subprocess.run([CMAKE_CMD, '-GNinja', '-B', builddir, f'-DTARGET_OS={info.os_name}', f'-DTARGET_ARCH={info.arch}', 
         f'-DCOMPRESSED_PTRS={1 if info.has_compressed_ptrs else 0}', '-DCMAKE_BUILD_TYPE=Release', '--log-level=NOTICE'], 
-        cwd=target_dir, check=True)
+        cwd=target_dir, check=True, env=my_env)
     
     # build and install dart vm library to packages directory
     subprocess.run([NINJA_CMD], cwd=builddir, check=True)

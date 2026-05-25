@@ -8,6 +8,8 @@ PRAGMA_WARNING(push, 0)
 #endif
 PRAGMA_WARNING(pop)
 #include <algorithm>
+#include <cerrno>
+#include <cstring>
 #include <stdexcept>
 #if defined(_WIN32) || defined(WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -36,21 +38,24 @@ static void* load_map_file(const char* path)
 {
 	HANDLE hFile = CreateFileA(path, GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 	if (hFile == INVALID_HANDLE_VALUE) {
-		printf("\nCannot find %s\n", path);
-		return NULL;
+		throw std::invalid_argument(std::format("Cannot open {}", path));
 	}
 
 	// because Dart API requires only snapshot buffer addresses (no relative access across snapshot),
 	//   so we can just mapping a whole file and find address of snapshots
 	HANDLE hMapFile = CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-	if (hMapFile == INVALID_HANDLE_VALUE)
-		return NULL;
+	if (hMapFile == INVALID_HANDLE_VALUE) {
+		CloseHandle(hFile);
+		throw std::invalid_argument(std::format("Cannot map {}", path));
+	}
 
 	// need RW because dart initialization need writing data in BSS
 	void* mem = MapViewOfFile(hMapFile, FILE_MAP_COPY, 0, 0, 0);
 	CloseHandle(hMapFile);
 
 	CloseHandle(hFile);
+	if (mem == NULL)
+		throw std::invalid_argument(std::format("Cannot map {}", path));
 	return mem;
 }
 #else
@@ -58,12 +63,19 @@ static void* load_map_file(const char* path)
 {
 	// need RW because dart initialization need writing data in BSS
 	int fd = open(path, O_RDONLY);
+	if (fd == -1)
+		throw std::invalid_argument(std::format("Cannot open {}: {}", path, strerror(errno)));
 	struct stat st;
 
-	fstat(fd, &st);
+	if (fstat(fd, &st) == -1) {
+		close(fd);
+		throw std::invalid_argument(std::format("Cannot stat {}: {}", path, strerror(errno)));
+	}
 	void* mem = mmap(NULL, st.st_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
 
 	close(fd);
+	if (mem == MAP_FAILED)
+		throw std::invalid_argument(std::format("Cannot map {}: {}", path, strerror(errno)));
 	return mem;
 }
 #endif
@@ -103,6 +115,10 @@ LibAppInfo ElfHelper::findSnapshots(const uint8_t* elf)
 		if (dynsym != nullptr && dynstr != nullptr)
 			break;
 	}
+	if (dynstr == nullptr)
+		throw std::invalid_argument("ELF: Cannot find dynamic string table");
+	if (dynsym == nullptr)
+		throw std::invalid_argument("ELF: Cannot find dynamic symbol table");
 
 	// find the required symbol addresses
 	const uint8_t* vm_snapshot_data = nullptr;

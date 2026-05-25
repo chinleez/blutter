@@ -8,8 +8,10 @@ import zlib
 from struct import unpack
 
 from elftools.elf.elffile import ELFFile
-from elftools.elf.enums import ENUM_E_MACHINE 
-from elftools.elf.sections import SymbolTableSection
+
+
+class DartInfoError(Exception):
+    pass
 
 # TODO: support both ELF and Mach-O file
 def extract_snapshot_hash_flags(libapp_file):
@@ -17,13 +19,22 @@ def extract_snapshot_hash_flags(libapp_file):
         elf = ELFFile(f)
         # find "_kDartVmSnapshotData" symbol
         dynsym = elf.get_section_by_name('.dynsym')
-        sym = dynsym.get_symbol_by_name('_kDartVmSnapshotData')[0]
+        if dynsym is None:
+            raise DartInfoError(f"Cannot find .dynsym in {libapp_file}")
+        symbols = dynsym.get_symbol_by_name('_kDartVmSnapshotData')
+        if not symbols:
+            raise DartInfoError(f"Cannot find _kDartVmSnapshotData in {libapp_file}")
+        sym = symbols[0]
         #section = elf.get_section(sym['st_shndx'])
-        assert sym['st_size'] > 128
+        if sym['st_size'] <= 128:
+            raise DartInfoError(f"_kDartVmSnapshotData is too small in {libapp_file}")
         f.seek(sym['st_value']+20)
         snapshot_hash = f.read(32).decode()
         data = f.read(256) # should be enough
-        flags = data[:data.index(b'\0')].decode().strip().split(' ')
+        zero_pos = data.find(b'\0')
+        if zero_pos == -1:
+            raise DartInfoError(f"Cannot find snapshot flags terminator in {libapp_file}")
+        flags = data[:zero_pos].decode().strip().split(' ')
     
     return snapshot_hash, flags
 
@@ -32,19 +43,22 @@ def extract_libflutter_info(libflutter_file):
         elf = ELFFile(f)
         if elf.header.e_machine == 'EM_AARCH64': # 183
             arch = 'arm64'
-        elif elf.header.e_machine == 'EM_IA_64': # 50
+        elif elf.header.e_machine == 'EM_X86_64': # 62
             arch = 'x64'
         else:
-            assert False, f"Unsupport architecture: {elf.header.e_machine}"
+            raise DartInfoError(f"Unsupported architecture: {elf.header.e_machine}")
 
         section = elf.get_section_by_name('.rodata')
+        if section is None:
+            raise DartInfoError(f"Cannot find .rodata in {libflutter_file}")
         data = section.data()
         
         sha_hashes = re.findall(b'\x00([a-f\\d]{40})(?=\x00)', data)
         #print(sha_hashes)
         # all possible engine ids
         engine_ids = [ h.decode() for h in sha_hashes ]
-        assert len(engine_ids) == 2, f'found hashes {", ".join(engine_ids)}'
+        if len(engine_ids) != 2:
+            raise DartInfoError(f'Expected 2 engine hashes, found {len(engine_ids)}: {", ".join(engine_ids)}')
         
         # beta/dev version of flutter might not use stable dart version (we can get dart version from sdk with found engine_id)
         # support stable, beta and dev channels
@@ -60,7 +74,7 @@ def get_dart_sdk_url_size(engine_ids):
     #url = f'https://storage.googleapis.com/dart-archive/channels/stable/release/3.0.3/sdk/dartsdk-windows-x64-release.zip'
     for engine_id in engine_ids:
         url = f'https://storage.googleapis.com/flutter_infra_release/flutter/{engine_id}/dart-sdk-windows-x64.zip'
-        resp = requests.head(url)
+        resp = requests.head(url, timeout=30)
         if resp.status_code == 200:
            sdk_size = int(resp.headers['Content-Length'])
            return engine_id, url, sdk_size
@@ -76,7 +90,9 @@ def get_dart_commit(url):
     commit_id = None
     dart_version = None
     fp = None
-    with requests.get(url, headers={"Range": "bytes=0-4096"}, stream=True) as r:
+    if url is None:
+        return None, None
+    with requests.get(url, headers={"Range": "bytes=0-4096"}, stream=True, timeout=30) as r:
         if r.status_code // 10 == 20:
             x = next(r.iter_content(chunk_size=4096))
             fp = io.BytesIO(x)
@@ -92,7 +108,8 @@ def get_dart_commit(url):
             data = fp.read(compressSize)
             
             # expect compression method to be zipfile.ZIP_DEFLATED
-            assert compMethod == zipfile.ZIP_DEFLATED, 'Unexpected compression method'
+            if compMethod != zipfile.ZIP_DEFLATED:
+                raise DartInfoError('Unexpected compression method')
             if filename == b'dart-sdk/revision':
                 commit_id = zlib.decompress(data, wbits=-zlib.MAX_WBITS).decode().strip()
             elif filename == b'dart-sdk/version':
@@ -117,6 +134,8 @@ def extract_dart_info(libapp_file: str, libflutter_file: str):
         # print(sdk_size)
 
         commit_id, dart_version = get_dart_commit(sdk_url)
+        if dart_version is None:
+            raise DartInfoError(f'Cannot determine Dart version from engine hashes: {", ".join(engine_ids)}')
         # print(commit_id)
         # print(dart_version)
         #assert dart_version == dart_version_sdk
