@@ -8,7 +8,7 @@ For high priority missing features, see [TODO](#todo)
 
 
 ## Environment Setup
-This application uses C++20 Formatting library. It requires very recent C++ compiler such as g++>=13, Clang>=16.
+This application uses C++20 Formatting library. It requires very recent C++ compiler such as g++>=13 or Clang/libc++>=19 for Dart 3.12+.
 
 I recommend using Linux OS (only tested on Deiban sid/trixie) because it is easy to setup.
 
