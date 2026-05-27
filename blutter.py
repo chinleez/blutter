@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 import argparse
 import glob
+import json
 import mmap
 import os
 import shutil
@@ -19,6 +20,11 @@ BIN_DIR = os.path.join(SCRIPT_DIR, 'bin')
 PKG_INC_DIR = os.path.join(SCRIPT_DIR, 'packages', 'include')
 PKG_LIB_DIR = os.path.join(SCRIPT_DIR, 'packages', 'lib')
 BUILD_DIR = os.path.join(SCRIPT_DIR, 'build')
+PREBUILT_MANIFEST_FILES = [
+    os.path.join(SCRIPT_DIR, 'prebuilt', 'manifest.json'),
+    os.path.join(BIN_DIR, 'manifest.json'),
+]
+LOCAL_PREBUILT_MANIFEST_FILE = os.path.join(BIN_DIR, 'manifest.json')
 
 
 class BlutterInput:
@@ -45,6 +51,291 @@ class BlutterInput:
         # derive blutter executable filename
         self.blutter_name = f'blutter_{dart_info.lib_name}{self.name_suffix}'
         self.blutter_file = os.path.join(BIN_DIR, self.blutter_name) + ('.exe' if os.name == 'nt' else '')
+
+
+def dartvm_static_lib_file(dart_info: DartLibInfo):
+    if os.name == 'nt':
+        return os.path.join(PKG_LIB_DIR, dart_info.lib_name + '.lib')
+    return os.path.join(PKG_LIB_DIR, 'lib' + dart_info.lib_name + '.a')
+
+
+def dartvm_package_missing(dart_info: DartLibInfo):
+    cmake_dir = os.path.join(PKG_LIB_DIR, 'cmake', dart_info.lib_name)
+    required = [
+        dartvm_static_lib_file(dart_info),
+        os.path.join(PKG_INC_DIR, f'dartvm{dart_info.version}', 'vm', 'class_id.h'),
+        os.path.join(cmake_dir, f'{dart_info.lib_name}Config.cmake'),
+    ]
+    return [path for path in required if not os.path.exists(path)]
+
+
+def get_entry_value(entry, *names):
+    for name in names:
+        if name in entry:
+            return entry[name]
+    return None
+
+
+def bool_value(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        return value.lower() in ('1', 'true', 'yes', 'on')
+    return bool(value)
+
+
+def prebuilt_entry_matches(entry, input: BlutterInput):
+    version = get_entry_value(entry, 'version', 'dart_version')
+    target_os = get_entry_value(entry, 'target_os', 'os_name', 'os')
+    target_arch = get_entry_value(entry, 'target_arch', 'arch')
+    if version != input.dart_info.version:
+        return False
+    if target_os != input.dart_info.os_name or target_arch != input.dart_info.arch:
+        return False
+
+    lib_name = get_entry_value(entry, 'lib_name', 'dartvm')
+    if lib_name is not None and lib_name != input.dart_info.lib_name:
+        return False
+
+    blutter_name = get_entry_value(entry, 'blutter_name')
+    if blutter_name is not None and blutter_name != input.blutter_name:
+        return False
+
+    snapshot_hash = get_entry_value(entry, 'snapshot_hash', 'snapshot')
+    if input.dart_info.snapshot_hash is None:
+        if snapshot_hash not in (None, '', '*'):
+            return False
+    elif snapshot_hash not in (input.dart_info.snapshot_hash, '*'):
+        return False
+
+    compressed = get_entry_value(entry, 'compressed_pointers', 'has_compressed_ptrs')
+    if compressed is not None and bool_value(compressed) != input.dart_info.has_compressed_ptrs:
+        return False
+
+    no_analysis = get_entry_value(entry, 'no_analysis')
+    if no_analysis is not None and bool_value(no_analysis) != input.no_analysis:
+        return False
+
+    host = get_entry_value(entry, 'host', 'platform')
+    if host is not None and host not in (sys.platform, os.name):
+        return False
+
+    return True
+
+
+def relative_manifest_path(manifest_file: str, path: str):
+    return os.path.relpath(path, os.path.dirname(manifest_file))
+
+
+def local_manifest_entry_key(entry):
+    return (
+        get_entry_value(entry, 'version', 'dart_version'),
+        get_entry_value(entry, 'snapshot_hash', 'snapshot'),
+        get_entry_value(entry, 'target_os', 'os_name', 'os'),
+        get_entry_value(entry, 'target_arch', 'arch'),
+        bool_value(get_entry_value(entry, 'compressed_pointers', 'has_compressed_ptrs')),
+        bool_value(get_entry_value(entry, 'no_analysis')),
+        get_entry_value(entry, 'host', 'platform'),
+        get_entry_value(entry, 'blutter_name'),
+    )
+
+
+def manifest_artifact_key(entry):
+    return (
+        get_entry_value(entry, 'version', 'dart_version'),
+        get_entry_value(entry, 'target_os', 'os_name', 'os'),
+        get_entry_value(entry, 'target_arch', 'arch'),
+        bool_value(get_entry_value(entry, 'compressed_pointers', 'has_compressed_ptrs')),
+        bool_value(get_entry_value(entry, 'no_analysis')),
+        get_entry_value(entry, 'host', 'platform'),
+        get_entry_value(entry, 'blutter_name'),
+        get_entry_value(entry, 'lib_name', 'dartvm'),
+    )
+
+
+def make_local_manifest_entry(input: BlutterInput):
+    entry = {
+        'version': input.dart_info.version,
+        'target_os': input.dart_info.os_name,
+        'target_arch': input.dart_info.arch,
+        'compressed_pointers': input.dart_info.has_compressed_ptrs,
+        'no_analysis': input.no_analysis,
+        'host': sys.platform,
+        'lib_name': input.dart_info.lib_name,
+        'blutter_name': input.blutter_name,
+        'generated_by': 'blutter.py',
+    }
+    if input.dart_info.snapshot_hash is not None:
+        entry['snapshot_hash'] = input.dart_info.snapshot_hash
+    else:
+        entry['snapshot_hash'] = ''
+
+    if os.path.isfile(input.blutter_file):
+        entry['blutter'] = relative_manifest_path(LOCAL_PREBUILT_MANIFEST_FILE, input.blutter_file)
+    if not dartvm_package_missing(input.dart_info):
+        entry['dartvm_package'] = relative_manifest_path(LOCAL_PREBUILT_MANIFEST_FILE, os.path.join(SCRIPT_DIR, 'packages'))
+    return entry
+
+
+def write_local_prebuilt_manifest(input: BlutterInput):
+    if os.path.isfile(input.blutter_file) or not dartvm_package_missing(input.dart_info):
+        os.makedirs(os.path.dirname(LOCAL_PREBUILT_MANIFEST_FILE), exist_ok=True)
+        data = {'entries': []}
+        if os.path.isfile(LOCAL_PREBUILT_MANIFEST_FILE):
+            try:
+                with open(LOCAL_PREBUILT_MANIFEST_FILE, 'r', encoding='utf-8') as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict) and isinstance(loaded.get('entries'), list):
+                    data = loaded
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        new_entry = make_local_manifest_entry(input)
+        new_key = manifest_artifact_key(new_entry)
+        entries = [
+            entry for entry in data.get('entries', [])
+            if isinstance(entry, dict) and manifest_artifact_key(entry) != new_key
+        ]
+        entries.append(new_entry)
+        entries.sort(key=lambda entry: (
+            str(get_entry_value(entry, 'version', 'dart_version')),
+            str(get_entry_value(entry, 'snapshot_hash', 'snapshot')),
+            str(get_entry_value(entry, 'target_os', 'os_name', 'os')),
+            str(get_entry_value(entry, 'target_arch', 'arch')),
+            str(get_entry_value(entry, 'blutter_name')),
+        ))
+        data['entries'] = entries
+
+        with open(LOCAL_PREBUILT_MANIFEST_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+            f.write('\n')
+
+
+def load_prebuilt_entries():
+    entries = []
+    checked = []
+    for manifest_file in PREBUILT_MANIFEST_FILES:
+        if not os.path.isfile(manifest_file):
+            checked.append(f'missing manifest: {manifest_file}')
+            continue
+
+        try:
+            with open(manifest_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            checked.append(f'invalid manifest: {manifest_file} ({e})')
+            continue
+
+        manifest_entries = data
+        if isinstance(data, dict):
+            manifest_entries = data.get('entries', data.get('artifacts', []))
+        if not isinstance(manifest_entries, list):
+            checked.append(f'invalid manifest entries: {manifest_file}')
+            continue
+
+        for entry in manifest_entries:
+            if isinstance(entry, dict):
+                entries.append((manifest_file, entry))
+        checked.append(f'loaded manifest: {manifest_file}')
+
+    return entries, checked
+
+
+def resolve_manifest_path(manifest_file: str, path: str):
+    if os.path.isabs(path):
+        return path
+    return os.path.abspath(os.path.join(os.path.dirname(manifest_file), path))
+
+
+def copy_file_artifact(src: str, dst: str, executable=False):
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.copy2(src, dst)
+    if executable and os.name != 'nt':
+        os.chmod(dst, os.stat(dst).st_mode | 0o755)
+
+
+def copy_dir_artifact(src: str, dst: str):
+    shutil.copytree(src, dst, dirs_exist_ok=True)
+
+
+def copy_prebuilt_path(manifest_file: str, entry, key_names, dst: str, is_dir=False, executable=False):
+    src_path = get_entry_value(entry, *key_names)
+    if src_path is None:
+        return False
+
+    src = resolve_manifest_path(manifest_file, src_path)
+    if is_dir:
+        if not os.path.isdir(src):
+            return False
+        copy_dir_artifact(src, dst)
+    else:
+        if not os.path.isfile(src):
+            return False
+        copy_file_artifact(src, dst, executable=executable)
+    return True
+
+
+def install_prebuilt_artifacts(input: BlutterInput, need_blutter: bool, need_dartvm_package: bool):
+    installed = []
+    entries, checked = load_prebuilt_entries()
+    matched = False
+
+    for manifest_file, entry in entries:
+        if not prebuilt_entry_matches(entry, input):
+            continue
+        matched = True
+
+        if need_blutter and not os.path.isfile(input.blutter_file):
+            if copy_prebuilt_path(manifest_file, entry, ('blutter', 'blutter_file', 'binary'), input.blutter_file, executable=True):
+                installed.append(f'installed blutter binary from {manifest_file}')
+
+        if need_dartvm_package and dartvm_package_missing(input.dart_info):
+            if copy_prebuilt_path(manifest_file, entry, ('dartvm_package', 'package_dir'), os.path.join(SCRIPT_DIR, 'packages'), is_dir=True):
+                installed.append(f'installed Dart VM package from {manifest_file}')
+            copy_prebuilt_path(manifest_file, entry, ('dartvm_lib', 'static_lib'), dartvm_static_lib_file(input.dart_info))
+            include_dst = os.path.join(PKG_INC_DIR, f'dartvm{input.dart_info.version}')
+            copy_prebuilt_path(manifest_file, entry, ('dartvm_include', 'include_dir'), include_dst, is_dir=True)
+            cmake_dst = os.path.join(PKG_LIB_DIR, 'cmake', input.dart_info.lib_name)
+            copy_prebuilt_path(manifest_file, entry, ('dartvm_cmake', 'cmake_dir'), cmake_dst, is_dir=True)
+            if not dartvm_package_missing(input.dart_info):
+                installed.append(f'installed Dart VM package files from {manifest_file}')
+
+        if (not need_blutter or os.path.isfile(input.blutter_file)) and (not need_dartvm_package or not dartvm_package_missing(input.dart_info)):
+            break
+
+    if not matched:
+        checked.append('no matching prebuilt entry')
+    return installed, checked
+
+
+def format_missing_artifacts(input: BlutterInput, prebuilt_checked):
+    missing = []
+    if not os.path.isfile(input.blutter_file):
+        missing.append(f'blutter binary: {input.blutter_file}')
+    missing.extend(f'Dart VM package file: {path}' for path in dartvm_package_missing(input.dart_info))
+
+    lines = [
+        'Cannot continue without fetching Dart source because required artifacts are missing.',
+        '',
+        'Target:',
+        f'  Dart VM: {input.dart_info.lib_name}',
+        f'  Blutter binary: {input.blutter_name}',
+        f'  snapshot hash: {input.dart_info.snapshot_hash or "(not specified)"}',
+        f'  compressed-pointers: {input.dart_info.has_compressed_ptrs}',
+        f'  no-analysis: {input.no_analysis}',
+        '',
+        'Missing:',
+    ]
+    lines.extend(f'  - {item}' for item in missing)
+    lines.extend(['', 'Prebuilt cache checks:'])
+    lines.extend(f'  - {item}' for item in prebuilt_checked)
+    lines.extend([
+        '',
+        'Run without --offline to allow Dart source checkout/build, or add a matching prebuilt manifest entry.',
+    ])
+    return '\n'.join(lines)
 
 
 def find_lib_files(indir: str):
@@ -166,17 +457,25 @@ def get_dart_lib_info(libapp_path: str, libflutter_path: str) -> DartLibInfo:
     has_compressed_ptrs = 'compressed-pointers' in flags
     return DartLibInfo(dart_version, os_name, arch, has_compressed_ptrs, snapshot_hash)
 
-def build_and_run(input: BlutterInput):
-    if not os.path.isfile(input.blutter_file) or input.rebuild_blutter:
-        # before fetch and build, check the existence of compiled library first
-        #   so the src and build directories can be deleted
-        if os.name == 'nt':
-            dartlib_file = os.path.join(PKG_LIB_DIR, input.dart_info.lib_name+'.lib')
-        else:
-            dartlib_file = os.path.join(PKG_LIB_DIR, 'lib'+input.dart_info.lib_name+'.a')
-        if not os.path.isfile(dartlib_file):
+def build_and_run(input: BlutterInput, offline: bool):
+    needs_blutter_binary = not input.rebuild_blutter and not os.path.isfile(input.blutter_file)
+    needs_dartvm_package = input.rebuild_blutter or input.create_vs_sln or not os.path.isfile(input.blutter_file)
+    needs_dartvm_package = needs_dartvm_package and bool(dartvm_package_missing(input.dart_info))
+
+    prebuilt_checked = []
+    if needs_blutter_binary or needs_dartvm_package:
+        installed, prebuilt_checked = install_prebuilt_artifacts(input, needs_blutter_binary, needs_dartvm_package)
+        for message in installed:
+            print(message)
+
+    if not os.path.isfile(input.blutter_file) or input.rebuild_blutter or (input.create_vs_sln and dartvm_package_missing(input.dart_info)):
+        if dartvm_package_missing(input.dart_info):
+            if offline:
+                sys.exit(format_missing_artifacts(input, prebuilt_checked))
+            print('Dart VM package is missing from local/prebuilt cache; fetching and building Dart source.')
             from dartvm_fetch_build import fetch_and_build
             fetch_and_build(input.dart_info)
+            write_local_prebuilt_manifest(input)
         
         input.rebuild_blutter = True
 
@@ -207,32 +506,34 @@ def build_and_run(input: BlutterInput):
             # do not use SDK path for checking source code because Blutter does not depended on it and SDK might be removed
             cmake_blutter(input)
             assert os.path.isfile(input.blutter_file), "Build complete but cannot find Blutter binary: " + input.blutter_file
+            write_local_prebuilt_manifest(input)
 
-        # execute blutter    
-        subprocess.run([input.blutter_file, '-i', input.libapp_path, '-o', input.outdir], check=True)
+        # execute blutter
+        result = subprocess.run([input.blutter_file, '-i', input.libapp_path, '-o', input.outdir])
+        sys.exit(result.returncode)
 
-def main_no_flutter(libapp_path: str, dart_version: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool):
+def main_no_flutter(libapp_path: str, dart_version: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool, offline: bool):
     try:
         version, os_name, arch = dart_version.split('_')
     except ValueError:
         sys.exit('Invalid --dart-version format. Expected "<version>_<os>_<arch>", for example "3.4.2_android_arm64"')
     dart_info = DartLibInfo(version, os_name, arch)
     input = BlutterInput(libapp_path, dart_info, outdir, rebuild_blutter, create_vs_sln, no_analysis)
-    build_and_run(input)
+    build_and_run(input, offline)
     
-def main2(libapp_path: str, libflutter_path: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool):
+def main2(libapp_path: str, libflutter_path: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool, offline: bool):
     dart_info = get_dart_lib_info(libapp_path, libflutter_path)
     input = BlutterInput(libapp_path, dart_info, outdir, rebuild_blutter, create_vs_sln, no_analysis)
-    build_and_run(input)
+    build_and_run(input, offline)
 
-def main(indir: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool):
+def main(indir: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool, offline: bool):
     if indir.endswith(".apk"):
         with tempfile.TemporaryDirectory() as tmp_dir:
             libapp_file, libflutter_file = extract_libs_from_apk(indir, tmp_dir)
-            main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis)
+            main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis, offline)
     else:
         libapp_file, libflutter_file = find_lib_files(indir)
-        main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis)
+        main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis, offline)
 
 
 if __name__ == "__main__":
@@ -245,11 +546,12 @@ if __name__ == "__main__":
     parser.add_argument('--rebuild', action='store_true', default=False, help='Force rebuild the Blutter executable')
     parser.add_argument('--vs-sln', action='store_true', default=False, help='Generate Visual Studio solution at <outdir>')
     parser.add_argument('--no-analysis', action='store_true', default=False, help='Do not build with code analysis')
+    parser.add_argument('--offline', action='store_true', default=False, help='Do not checkout/build Dart source; use only local files or prebuilt manifests')
     # rare usage scenario
     parser.add_argument('--dart-version', help='Run without libflutter (indir become libapp.so) by specify dart version such as "3.4.2_android_arm64"')
     args = parser.parse_args()
 
     if args.dart_version is None:
-        main(args.indir, args.outdir, args.rebuild, args.vs_sln, args.no_analysis)
+        main(args.indir, args.outdir, args.rebuild, args.vs_sln, args.no_analysis, args.offline)
     else:
-        main_no_flutter(args.indir, args.dart_version, args.outdir, args.rebuild, args.vs_sln, args.no_analysis)
+        main_no_flutter(args.indir, args.dart_version, args.outdir, args.rebuild, args.vs_sln, args.no_analysis, args.offline)

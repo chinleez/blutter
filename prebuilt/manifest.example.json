@@ -1,0 +1,14 @@
+{
+  "entries": [
+    {
+      "version": "3.12.1",
+      "snapshot_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "target_os": "android",
+      "target_arch": "arm64",
+      "compressed_pointers": true,
+      "host": "darwin",
+      "blutter": "artifacts/darwin/blutter_dartvm3.12.1_android_arm64",
+      "dartvm_package": "artifacts/darwin/packages"
+    }
+  ]
+}

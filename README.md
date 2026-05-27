@@ -57,6 +57,28 @@ The blutter.py will automatically detect the Dart version from the flutter engin
 
 If the blutter executable for required Dart version does not exists, the script will automatically checkout Dart source code and compiling it.
 
+To prevent automatic Dart source checkout/build, use ```--offline```. In offline mode Blutter only uses existing ```bin/``` and ```packages/``` files or matching entries from a local prebuilt manifest.
+
+```
+python3 blutter.py path/to/app/lib/arm64-v8a out_dir --offline
+```
+
+Local prebuilt manifests are loaded from ```prebuilt/manifest.json``` and ```bin/manifest.json```. See ```prebuilt/manifest.example.json``` for the schema. A manifest entry can provide a prebuilt Blutter binary and/or a complete installed Dart VM package directory. When a target app exposes a snapshot hash, prebuilt entries must use the same ```snapshot_hash``` or explicitly use ```"*"```.
+
+After a successful source build, Blutter writes a local cache entry to ```bin/manifest.json``` so the same Dart VM target can be reused without rebuilding.
+
+You can prebuild a common Dart version matrix and write ```prebuilt/manifest.json```:
+
+```
+python3 scripts/build_prebuilt_matrix.py \
+  --versions 3.3.0 3.4.0 3.5.0 3.6.0 3.7.0 3.8.0 3.9.0 3.10.0 3.11.0 3.11.4 3.12.1 \
+  --target-os android \
+  --target-arch arm64 \
+  --compressed-pointers true
+```
+
+The matrix script writes wildcard ```snapshot_hash``` entries by default. If a target requires an exact snapshot hash, rebuild that entry with ```--snapshot-hash <hash>```. The local artifact paths are keyed by Dart VM version, target, pointer mode, and analysis mode, so rebuilding the same target with a different snapshot hash replaces the previous manifest entry for that target.
+
 ## Update
 You can use ```git pull``` to update and run blutter.py with ```--rebuild``` option to force rebuild the executable
 ```
