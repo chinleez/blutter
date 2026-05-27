@@ -25,6 +25,8 @@ PREBUILT_MANIFEST_FILES = [
     os.path.join(BIN_DIR, 'manifest.json'),
 ]
 LOCAL_PREBUILT_MANIFEST_FILE = os.path.join(BIN_DIR, 'manifest.json')
+ANDROID_SUPPORTED_ABIS = ('arm64-v8a',)
+ANDROID_ABI_PRIORITY = ('arm64-v8a',)
 
 
 class BlutterInput:
@@ -353,19 +355,48 @@ def find_lib_files(indir: str):
     
     return os.path.abspath(app_file), os.path.abspath(flutter_file)
 
+def find_apk_lib_pair(zf: zipfile.ZipFile):
+    names = set(zf.namelist())
+    pairs = []
+
+    for name in names:
+        parts = name.split('/')
+        if len(parts) != 3 or parts[0] != 'lib' or parts[2] != 'libapp.so':
+            continue
+
+        abi = parts[1]
+        flutter_name = f'lib/{abi}/libflutter.so'
+        if flutter_name in names:
+            pairs.append((abi, name, flutter_name))
+
+    if not pairs:
+        sys.exit("Cannot find paired libapp.so and libflutter.so under lib/<abi>/ in the APK")
+
+    for abi in ANDROID_ABI_PRIORITY:
+        for pair in pairs:
+            if pair[0] == abi:
+                return pair
+
+    found_abis = ', '.join(sorted({abi for abi, _, _ in pairs}))
+    supported_abis = ', '.join(ANDROID_SUPPORTED_ABIS)
+    sys.exit(f"Unsupported APK ABI(s): {found_abis}. Blutter currently supports only: {supported_abis}")
+
+
+def extract_zip_member(zf: zipfile.ZipFile, member_name: str, dst_file: str):
+    os.makedirs(os.path.dirname(dst_file), exist_ok=True)
+    with zf.open(member_name, 'r') as src, open(dst_file, 'wb') as dst:
+        shutil.copyfileobj(src, dst)
+
+
 def extract_libs_from_apk(apk_file: str, out_dir: str):
     with zipfile.ZipFile(apk_file, "r") as zf:
-        try:
-            app_info = zf.getinfo('lib/arm64-v8a/libapp.so')
-            flutter_info = zf.getinfo('lib/arm64-v8a/libflutter.so')
-        except:
-            sys.exit("Cannot find libapp.so or libflutter.so in the APK")
+        abi, app_member, flutter_member = find_apk_lib_pair(zf)
+        extract_dir = os.path.join(out_dir, abi)
+        app_file = os.path.join(extract_dir, 'libapp.so')
+        flutter_file = os.path.join(extract_dir, 'libflutter.so')
 
-        zf.extract(app_info, out_dir)
-        zf.extract(flutter_info, out_dir)
-
-        app_file = os.path.join(out_dir, app_info.filename)
-        flutter_file = os.path.join(out_dir, flutter_info.filename)
+        extract_zip_member(zf, app_member, app_file)
+        extract_zip_member(zf, flutter_member, flutter_file)
         return app_file, flutter_file
 
 def find_compat_macro(dart_version: str, no_analysis: bool):
@@ -527,10 +558,13 @@ def main2(libapp_path: str, libflutter_path: str, outdir: str, rebuild_blutter: 
     build_and_run(input, offline)
 
 def main(indir: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool, offline: bool):
-    if indir.endswith(".apk"):
+    input_ext = os.path.splitext(indir)[1].lower()
+    if input_ext == ".apk":
         with tempfile.TemporaryDirectory() as tmp_dir:
             libapp_file, libflutter_file = extract_libs_from_apk(indir, tmp_dir)
             main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis, offline)
+    elif input_ext == ".ipa":
+        sys.exit("IPA input is not supported yet because Blutter still parses Android ELF libapp/libflutter files only")
     else:
         libapp_file, libflutter_file = find_lib_files(indir)
         main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis, offline)
@@ -540,7 +574,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         prog='B(l)utter',
         description='Reversing a flutter application tool')
-    # TODO: accept ipa
     parser.add_argument('indir', help='An apk or a directory that contains both libapp.so and libflutter.so')
     parser.add_argument('outdir', help='An output directory')
     parser.add_argument('--rebuild', action='store_true', default=False, help='Force rebuild the Blutter executable')

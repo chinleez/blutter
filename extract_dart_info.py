@@ -13,6 +13,14 @@ from elftools.elf.elffile import ELFFile
 class DartInfoError(Exception):
     pass
 
+
+DART_SDK_REVISION_FILE = b'dart-sdk/revision'
+DART_SDK_VERSION_FILE = b'dart-sdk/version'
+ZIP_LOCAL_FILE_HEADER = 0x04034b50
+ZIP_CENTRAL_DIR_HEADER = 0x02014b50
+ZIP_END_CENTRAL_DIR = 0x06054b50
+ZIP_TAIL_SIZE = 256 * 1024
+
 # TODO: support both ELF and Mach-O file
 def extract_snapshot_hash_flags(libapp_file):
     with open(libapp_file, 'rb') as f:
@@ -81,7 +89,153 @@ def get_dart_sdk_url_size(engine_ids):
     
     return None, None, None
 
-def get_dart_commit(url):
+def read_http_range(url, start, end):
+    with requests.get(url, headers={"Range": f"bytes={start}-{end}"}, stream=True, timeout=30) as r:
+        if r.status_code // 100 != 2:
+            return None
+
+        chunks = []
+        for chunk in r.iter_content(chunk_size=64 * 1024):
+            if chunk:
+                chunks.append(chunk)
+        data = b''.join(chunks)
+        if r.status_code == 200 and start > 0 and len(data) > end:
+            return data[start:end + 1]
+        return data
+
+
+def decode_zip_member(comp_method, data):
+    if comp_method == zipfile.ZIP_STORED:
+        return data
+    if comp_method == zipfile.ZIP_DEFLATED:
+        return zlib.decompress(data, wbits=-zlib.MAX_WBITS)
+    raise DartInfoError(f'Unexpected compression method: {comp_method}')
+
+
+def parse_local_zip_entries(data):
+    commit_id = None
+    dart_version = None
+    fp = io.BytesIO(data)
+
+    while fp.tell() <= len(data) - 30 and (commit_id is None or dart_version is None):
+        pos = fp.tell()
+        sig_data = fp.read(4)
+        if len(sig_data) != 4:
+            break
+        sig, = unpack('<I', sig_data)
+        if sig != ZIP_LOCAL_FILE_HEADER:
+            break
+
+        _, _, comp_method, _, _, _, compress_size, _, filename_len, extra_len = unpack('<HHHHHIIIHH', fp.read(26))
+        filename = fp.read(filename_len)
+        if extra_len > 0:
+            fp.seek(extra_len, io.SEEK_CUR)
+
+        if fp.tell() + compress_size > len(data):
+            fp.seek(pos)
+            break
+
+        compressed = fp.read(compress_size)
+        if filename == DART_SDK_REVISION_FILE:
+            commit_id = decode_zip_member(comp_method, compressed).decode().strip()
+        elif filename == DART_SDK_VERSION_FILE:
+            dart_version = decode_zip_member(comp_method, compressed).decode().strip()
+
+    return commit_id, dart_version
+
+
+def find_zip_eocd(data):
+    min_eocd_len = 22
+    pos = data.rfind(b'PK\x05\x06')
+    if pos == -1 or len(data) - pos < min_eocd_len:
+        return None
+    return pos
+
+
+def parse_central_directory(data):
+    entries = {}
+    fp = io.BytesIO(data)
+
+    while fp.tell() <= len(data) - 46:
+        sig, = unpack('<I', fp.read(4))
+        if sig != ZIP_CENTRAL_DIR_HEADER:
+            break
+
+        fields = unpack('<HHHHHHIIIHHHHHII', fp.read(42))
+        comp_method = fields[3]
+        compress_size = fields[7]
+        filename_len = fields[9]
+        extra_len = fields[10]
+        comment_len = fields[11]
+        local_header_offset = fields[15]
+        filename = fp.read(filename_len)
+        if extra_len > 0:
+            fp.seek(extra_len, io.SEEK_CUR)
+        if comment_len > 0:
+            fp.seek(comment_len, io.SEEK_CUR)
+
+        if filename in (DART_SDK_REVISION_FILE, DART_SDK_VERSION_FILE):
+            entries[filename] = (local_header_offset, comp_method, compress_size)
+
+    return entries
+
+
+def read_remote_zip_member(url, local_header_offset, comp_method, compress_size):
+    header = read_http_range(url, local_header_offset, local_header_offset + 29)
+    if header is None or len(header) < 30:
+        return None
+
+    sig, = unpack('<I', header[:4])
+    if sig != ZIP_LOCAL_FILE_HEADER:
+        return None
+
+    _, _, local_comp_method, _, _, _, _, _, filename_len, extra_len = unpack('<HHHHHIIIHH', header[4:30])
+    if local_comp_method != comp_method:
+        raise DartInfoError('Compression method mismatch between local and central zip headers')
+
+    data_start = local_header_offset + 30 + filename_len + extra_len
+    compressed = read_http_range(url, data_start, data_start + compress_size - 1)
+    if compressed is None or len(compressed) < compress_size:
+        return None
+
+    return decode_zip_member(comp_method, compressed[:compress_size]).decode().strip()
+
+
+def get_dart_commit_from_central_directory(url, sdk_size):
+    tail_start = max(0, sdk_size - ZIP_TAIL_SIZE)
+    tail = read_http_range(url, tail_start, sdk_size - 1)
+    if tail is None:
+        return None, None
+
+    eocd_pos = find_zip_eocd(tail)
+    if eocd_pos is None:
+        return None, None
+
+    eocd = tail[eocd_pos:eocd_pos + 22]
+    _, _, _, _, _, central_size, central_offset, _ = unpack('<IHHHHIIH', eocd)
+    central_end = central_offset + central_size
+
+    if central_offset >= tail_start and central_end <= sdk_size:
+        start = central_offset - tail_start
+        central = tail[start:start + central_size]
+    else:
+        central = read_http_range(url, central_offset, central_end - 1)
+        if central is None:
+            return None, None
+
+    entries = parse_central_directory(central)
+    commit_id = None
+    dart_version = None
+
+    if DART_SDK_REVISION_FILE in entries:
+        commit_id = read_remote_zip_member(url, *entries[DART_SDK_REVISION_FILE])
+    if DART_SDK_VERSION_FILE in entries:
+        dart_version = read_remote_zip_member(url, *entries[DART_SDK_VERSION_FILE])
+
+    return commit_id, dart_version
+
+
+def get_dart_commit(url, sdk_size=None):
     # in downloaded zip
     # * dart-sdk/revision - the dart commit id of https://github.com/dart-lang/sdk/
     # * dart-sdk/version  - the dart version
@@ -89,33 +243,16 @@ def get_dart_commit(url):
     # using stream in case a server does not support range
     commit_id = None
     dart_version = None
-    fp = None
     if url is None:
         return None, None
-    with requests.get(url, headers={"Range": "bytes=0-4096"}, stream=True, timeout=30) as r:
-        if r.status_code // 10 == 20:
-            x = next(r.iter_content(chunk_size=4096))
-            fp = io.BytesIO(x)
-    
-    if fp is not None:
-        while fp.tell() < 4096-30 and (commit_id is None or dart_version is None):
-            #sig, ver, flags, compression, filetime, filedate, crc, compressSize, uncompressSize, filenameLen, extraLen = unpack(fp, '<IHHHHHIIIHH')
-            _, _, _, compMethod, _, _, _, compressSize, _, filenameLen, extraLen = unpack('<IHHHHHIIIHH', fp.read(30))
-            filename = fp.read(filenameLen)
-            #print(filename)
-            if extraLen > 0:
-                fp.seek(extraLen, io.SEEK_CUR)
-            data = fp.read(compressSize)
-            
-            # expect compression method to be zipfile.ZIP_DEFLATED
-            if compMethod != zipfile.ZIP_DEFLATED:
-                raise DartInfoError('Unexpected compression method')
-            if filename == b'dart-sdk/revision':
-                commit_id = zlib.decompress(data, wbits=-zlib.MAX_WBITS).decode().strip()
-            elif filename == b'dart-sdk/version':
-                dart_version = zlib.decompress(data, wbits=-zlib.MAX_WBITS).decode().strip()
-    
-    # TODO: if no revision and version in first 4096 bytes, get the file location from the first zip dir entries at the end of file (less than 256KB)
+
+    head = read_http_range(url, 0, 4095)
+    if head is not None:
+        commit_id, dart_version = parse_local_zip_entries(head)
+
+    if (commit_id is None or dart_version is None) and sdk_size is not None:
+        commit_id, dart_version = get_dart_commit_from_central_directory(url, sdk_size)
+
     return commit_id, dart_version
 
 def extract_dart_info(libapp_file: str, libflutter_file: str):
@@ -133,7 +270,7 @@ def extract_dart_info(libapp_file: str, libflutter_file: str):
         # print(sdk_url)
         # print(sdk_size)
 
-        commit_id, dart_version = get_dart_commit(sdk_url)
+        commit_id, dart_version = get_dart_commit(sdk_url, sdk_size)
         if dart_version is None:
             raise DartInfoError(f'Cannot determine Dart version from engine hashes: {", ".join(engine_ids)}')
         # print(commit_id)

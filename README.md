@@ -1,4 +1,6 @@
 # B(l)utter
+[中文说明](README_CN.md)
+
 Flutter Mobile Application Reverse Engineering Tool by Compiling Dart AOT Runtime
 
 Currently the application supports only Android libapp.so (arm64 only).
@@ -49,7 +51,12 @@ pip3 install pyelftools requests
 ```
 
 ## Usage
-Extract "lib" directory from apk file
+Pass an APK directly:
+```
+python3 blutter.py path/to/app.apk out_dir
+```
+
+Or pass a directory that contains both `libapp.so` and `libflutter.so`:
 ```
 python3 blutter.py path/to/app/lib/arm64-v8a out_dir
 ```
@@ -117,4 +124,4 @@ python blutter.py path\to\lib\arm64-v8a build\vs --vs-sln
   - Object modification
 - Obfuscated app (still missing many functions)
 - Reading iOS binary
-- Input as apk or ipa
+- Input as ipa after iOS binary support

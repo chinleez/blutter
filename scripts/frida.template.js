@@ -35,22 +35,29 @@ function tryLoadLibapp() {
 }
 tryLoadLibapp();
 
-const PointerCompressedEnabled = true;
-const CompressedWordSize = 4;
+const CompressedWordSize = __DART_COMPRESSED_WORD_SIZE__;
+const PointerCompressedEnabled = CompressedWordSize === 4;
 const HeapAddressReg = 'x28';
 const NullReg = 'x22';
 const StackReg = 'x15';
 
-if (!PointerCompressedEnabled)
-    console.error("now support only compressed pointer");
+if (CompressedWordSize !== 4 && CompressedWordSize !== Process.pointerSize)
+    console.error(`Unexpected Dart word size: ${CompressedWordSize}`);
 
 let HeapAddress = 0;
 // this function must be called at least on first interception of Dart function
 function init(context) {
-    if (HeapAddress === 0) {
+    if (PointerCompressedEnabled && HeapAddress === 0) {
         // heap bit register value is not shifted
         HeapAddress = context[HeapAddressReg].shl(32);
     }
+}
+
+function readDartPointer(addr) {
+    if (PointerCompressedEnabled) {
+        return ptr(addr.readU32());
+    }
+    return addr.readPointer();
 }
 
 function getDartBool(ptr, cls) {
@@ -82,7 +89,7 @@ function getDartArray(ptr, cls, depthLeft, glen = null) {
     let vals = [];
     let dataPtr = ptr.add(cls.dataOffset);
     for (let i = 0; i < len; i++) {
-        let dptr = dataPtr.add(i * CompressedWordSize).readPointer();
+        let dptr = readDartPointer(dataPtr.add(i * CompressedWordSize));
         const [tptr, ocls, fieldValue] = getTaggedObjectValue(dptr, depthLeft - 1);
         if ([CidNull, CidSmi, CidMint, CidDouble, CidBool, CidString, CidTwoByteString].includes(ocls.id)) {
             vals.push(fieldValue);
@@ -132,8 +139,8 @@ function getDartLinkedHashData(ptr, cls, depthLeft, isMap) {
         let result = {};
         for (let i = 0; i < usedData; i += 2) {
             try {
-                let keyPtr = arrPtr.add(dataCls.dataOffset + i * CompressedWordSize).readPointer();
-                let valPtr = arrPtr.add(dataCls.dataOffset + (i + 1) * CompressedWordSize).readPointer();
+                let keyPtr = readDartPointer(arrPtr.add(dataCls.dataOffset + i * CompressedWordSize));
+                let valPtr = readDartPointer(arrPtr.add(dataCls.dataOffset + (i + 1) * CompressedWordSize));
                 const [kTptr, kCls, kVal] = getTaggedObjectValue(keyPtr, depthLeft - 1);
                 const [vTptr, vCls, vVal] = getTaggedObjectValue(valPtr, depthLeft - 1);
                 if (kCls.id === CidNull) continue;
@@ -146,7 +153,7 @@ function getDartLinkedHashData(ptr, cls, depthLeft, isMap) {
         let items = [];
         for (let i = 0; i < usedData; i++) {
             try {
-                let valPtr = arrPtr.add(dataCls.dataOffset + i * CompressedWordSize).readPointer();
+                let valPtr = readDartPointer(arrPtr.add(dataCls.dataOffset + i * CompressedWordSize));
                 const [vTptr, vCls, vVal] = getTaggedObjectValue(valPtr, depthLeft - 1);
                 if (vCls.id === CidNull) continue;
                 items.push(vVal);
@@ -166,7 +173,7 @@ function getDartSet(ptr, cls, depthLeft) {
 
 function isFieldNative(fieldBitmap, offset) {
     const idx = offset / CompressedWordSize;
-    return (fieldBitmap & (1 << idx)) !== 0;
+    return (BigInt(fieldBitmap) & (1n << BigInt(idx))) !== 0n;
 }
 
 // tptr (tagged pointer) is only for tagged object (HeapBit in address except Smi)
@@ -271,11 +278,11 @@ function getInstanceValue(ptr, cls, scls, depthLeft = MaxDepth) {
                 val = ptr.add(offset).readDouble();
                 values[`off_${offset.toString(16)}`] = val;
             }
-            offset += CompressedWordSize * 2;
+            offset += PointerCompressedEnabled ? CompressedWordSize * 2 : CompressedWordSize;
         }
         else {
             // object
-            let dptr = ptr.add(offset).readPointer();
+            let dptr = readDartPointer(ptr.add(offset));
             const [tptr, ocls, fieldValue] = getTaggedObjectValue(dptr, depthLeft - 1);
             if (ocls.id === CidSmi) {
                 values[`off_${offset.toString(16)}!Smi`] = fieldValue;
@@ -298,8 +305,7 @@ function getInstanceValue(ptr, cls, scls, depthLeft = MaxDepth) {
 function getTaggedObjectValue(tptr, depthLeft = MaxDepth) {
     if (!isHeapObject(tptr)) {
         // smi
-        // TODO: below support only compressed pointer (4 bytes)
-        return [tptr, Classes[CidSmi], tptr.toInt32() >> 1];
+        return [tptr, Classes[CidSmi], getSmiValue(tptr)];
     }
 
     tptr = decompressPointer(tptr);
@@ -317,6 +323,19 @@ function getArg(context, idx) {
 
 function isHeapObject(ptr) {
     return (ptr.toInt32() & 1) == 1;
+}
+
+function getSmiValue(tptr) {
+    if (PointerCompressedEnabled) {
+        return tptr.toInt32() >> 1;
+    }
+
+    const raw = BigInt.asIntN(Process.pointerSize * 8, BigInt(tptr.toString()));
+    const val = raw >> 1n;
+    if (val <= BigInt(Number.MAX_SAFE_INTEGER) && val >= BigInt(Number.MIN_SAFE_INTEGER)) {
+        return Number(val);
+    }
+    return val;
 }
 
 function getObjectTag(ptr) {

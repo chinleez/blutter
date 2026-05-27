@@ -2,17 +2,36 @@
 #include "FridaWriter.h"
 #include <fstream>
 #include <filesystem>
+#include <sstream>
+#include <stdexcept>
 #include "Util.h"
 
 #ifndef FRIDA_TEMPLATE_DIR
 #define FRIDA_TEMPLATE_DIR "scripts"
 #endif
 
+static void ReplaceAll(std::string& text, const std::string& from, const std::string& to)
+{
+	size_t pos = 0;
+	while ((pos = text.find(from, pos)) != std::string::npos) {
+		text.replace(pos, from.size(), to);
+		pos += to.size();
+	}
+}
+
 void FridaWriter::Create(const char* filename)
 {
-	std::filesystem::copy_file(FRIDA_TEMPLATE_DIR "/frida.template.js", filename, std::filesystem::copy_options::overwrite_existing);
+	std::ifstream templateFile(FRIDA_TEMPLATE_DIR "/frida.template.js");
+	if (!templateFile)
+		throw std::runtime_error("Cannot open Frida template file");
 
-	std::ofstream of(filename, std::ios_base::app);
+	std::ostringstream templateStream;
+	templateStream << templateFile.rdbuf();
+	auto templateText = templateStream.str();
+	ReplaceAll(templateText, "__DART_COMPRESSED_WORD_SIZE__", std::to_string(dart::kCompressedWordSize));
+
+	std::ofstream of(filename);
+	of << templateText;
 
 	of << "const ClassIdTagPos = " << kUntaggedObjectClassIdTagPos << ";\n";
 	of << std::format("const ClassIdTagMask = {:#x};\n", (1 << dart::UntaggedObject::kClassIdTagSize) - 1);
@@ -148,7 +167,7 @@ void FridaWriter::Create(const char* filename)
 			of << "{";
 			of << "id:" << dartCls->Id() << ",";
 			of << "name:" << Util::Quote(dartCls->Name()) << ",";
-			of << "fbitmap:" << dartCls->FieldBitmap() << ",";
+			of << "fbitmap:" << dartCls->FieldBitmap() << "n,";
 			of << "sid:" << dartCls->Parent()->Id() << ",";
 			of << "size:" << dartCls->Size() << ",";
 			of << "argOffset:" << dartCls->TypeArgumentOffset();// << ",";
